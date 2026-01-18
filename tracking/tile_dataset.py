@@ -1,5 +1,7 @@
 import argparse
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -38,10 +40,10 @@ def _tile_starts(full: int, tile: int, overlap: float) -> list[int]:
     return sorted(set(starts))
 
 
-def _read_yolo_labels(label_path: Path, *, image_w: int, image_h: int) -> list[Box]:
+def _read_yolo_label_rows(label_path: Path) -> list[tuple[int, float, float, float, float]]:
     if not label_path.exists():
         return []
-    boxes: list[Box] = []
+    rows: list[tuple[int, float, float, float, float]] = []
     for raw in label_path.read_text().splitlines():
         line = raw.strip()
         if not line:
@@ -57,20 +59,34 @@ def _read_yolo_labels(label_path: Path, *, image_w: int, image_h: int) -> list[B
             h = float(parts[4])
         except ValueError:
             continue
+        rows.append((cls_id, xc, yc, w, h))
+    return rows
 
-        x1 = (xc - w / 2.0) * float(image_w)
-        y1 = (yc - h / 2.0) * float(image_h)
-        x2 = (xc + w / 2.0) * float(image_w)
-        y2 = (yc + h / 2.0) * float(image_h)
 
-        x1 = max(0.0, min(float(image_w), x1))
-        y1 = max(0.0, min(float(image_h), y1))
-        x2 = max(0.0, min(float(image_w), x2))
-        y2 = max(0.0, min(float(image_h), y2))
+def _labels_to_boxes(
+    rows: Iterable[tuple[int, float, float, float, float]], *, image_w: int, image_h: int
+) -> list[Box]:
+    boxes: list[Box] = []
+    w_f = float(image_w)
+    h_f = float(image_h)
+    for cls_id, xc, yc, w, h in rows:
+        x1 = (xc - w / 2.0) * w_f
+        y1 = (yc - h / 2.0) * h_f
+        x2 = (xc + w / 2.0) * w_f
+        y2 = (yc + h / 2.0) * h_f
+
+        x1 = max(0.0, min(w_f, x1))
+        y1 = max(0.0, min(h_f, y1))
+        x2 = max(0.0, min(w_f, x2))
+        y2 = max(0.0, min(h_f, y2))
         if x2 <= x1 or y2 <= y1:
             continue
         boxes.append(Box(cls_id=cls_id, x1=x1, y1=y1, x2=x2, y2=y2))
     return boxes
+
+
+def _read_yolo_labels(label_path: Path, *, image_w: int, image_h: int) -> list[Box]:
+    return _labels_to_boxes(_read_yolo_label_rows(label_path), image_w=image_w, image_h=image_h)
 
 
 def _boxes_in_tile(
@@ -160,6 +176,79 @@ def _choose_best_tile(
     return int(x0), int(y0)
 
 
+def _resolve_workers(workers: Optional[int]) -> int:
+    if workers is None:
+        cpu = os.cpu_count() or 1
+        return max(1, min(8, cpu))
+    return max(1, int(workers))
+
+
+def _process_image(
+    img_path: Path,
+    *,
+    images_dir: Path,
+    labels_dir: Path,
+    split_images_out: Path,
+    split_labels_out: Path,
+    tile_w_eff: int,
+    tile_h_eff: int,
+    overlap: float,
+    focus_class_id: Optional[int],
+    strategy: str,
+) -> tuple[list[str], int]:
+    rel = img_path.relative_to(images_dir)
+    label_path = labels_dir / rel.with_suffix(".txt")
+    raw_labels = _read_yolo_label_rows(label_path)
+    if not raw_labels:
+        return [], 0
+    if focus_class_id is not None and not any(row[0] == int(focus_class_id) for row in raw_labels):
+        return [], 0
+
+    img = cv2.imread(img_path.as_posix())
+    if img is None:
+        return [], 0
+    h, w = img.shape[:2]
+    tw = int(min(max(1, tile_w_eff), w))
+    th = int(min(max(1, tile_h_eff), h))
+    xs = _tile_starts(w, tw, overlap)
+    ys = _tile_starts(h, th, overlap)
+
+    boxes = _labels_to_boxes(raw_labels, image_w=w, image_h=h)
+    if not boxes:
+        return [], 0
+
+    selected_tiles: list[tuple[int, int]]
+    if strategy == "centered" and focus_class_id is not None:
+        focus = [b for b in boxes if b.cls_id == int(focus_class_id)]
+        chosen = {_choose_best_tile(px=b.cx, py=b.cy, xs=xs, ys=ys, tile_w=tw, tile_h=th) for b in focus}
+        selected_tiles = sorted(chosen)
+    else:
+        selected_tiles = [(x0, y0) for y0 in ys for x0 in xs]
+
+    tile_paths: list[str] = []
+    tiles_written = 0
+    for x0, y0 in selected_tiles:
+        tile_boxes = _boxes_in_tile(boxes, x0=x0, y0=y0, tile_w=tw, tile_h=th)
+        if focus_class_id is not None and not any(b.cls_id == int(focus_class_id) for b in tile_boxes):
+            continue
+        if not tile_boxes:
+            continue
+
+        tile_img = img[y0 : y0 + th, x0 : x0 + tw]
+        out_img_path = (split_images_out / rel.parent / f"{rel.stem}_x{x0}_y{y0}{img_path.suffix}").resolve()
+        out_lbl_path = (split_labels_out / rel.parent / f"{rel.stem}_x{x0}_y{y0}.txt").resolve()
+        out_img_path.parent.mkdir(parents=True, exist_ok=True)
+        out_lbl_path.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(out_img_path.as_posix(), tile_img)
+        if not ok:
+            continue
+        _write_yolo_labels(out_lbl_path, tile_boxes, image_w=tw, image_h=th)
+        tile_paths.append(out_img_path.as_posix())
+        tiles_written += 1
+
+    return tile_paths, tiles_written
+
+
 def build_tiled_split(
     *,
     images_dir: Path,
@@ -174,6 +263,7 @@ def build_tiled_split(
     strategy: str,
     include_original: bool,
     limit: Optional[int],
+    workers: Optional[int],
 ) -> tuple[list[str], int]:
     split_images_out = out_root / "images" / split
     split_labels_out = out_root / "labels" / split
@@ -196,46 +286,42 @@ def build_tiled_split(
         train_list.extend(p.as_posix() for p in image_paths)
 
     tiles_written = 0
-    for img_path in image_paths:
-        img = cv2.imread(img_path.as_posix())
-        if img is None:
-            continue
-        h, w = img.shape[:2]
-        tw = int(min(max(1, tile_w_eff), w))
-        th = int(min(max(1, tile_h_eff), h))
-        xs = _tile_starts(w, tw, overlap)
-        ys = _tile_starts(h, th, overlap)
+    workers = _resolve_workers(workers)
+    if workers <= 1:
+        for img_path in image_paths:
+            tile_paths, count = _process_image(
+                img_path,
+                images_dir=images_dir,
+                labels_dir=labels_dir,
+                split_images_out=split_images_out,
+                split_labels_out=split_labels_out,
+                tile_w_eff=tile_w_eff,
+                tile_h_eff=tile_h_eff,
+                overlap=overlap,
+                focus_class_id=focus_class_id,
+                strategy=strategy,
+            )
+            train_list.extend(tile_paths)
+            tiles_written += count
+    else:
+        def run_one(img_path: Path) -> tuple[list[str], int]:
+            return _process_image(
+                img_path,
+                images_dir=images_dir,
+                labels_dir=labels_dir,
+                split_images_out=split_images_out,
+                split_labels_out=split_labels_out,
+                tile_w_eff=tile_w_eff,
+                tile_h_eff=tile_h_eff,
+                overlap=overlap,
+                focus_class_id=focus_class_id,
+                strategy=strategy,
+            )
 
-        rel = img_path.relative_to(images_dir)
-        label_path = labels_dir / rel.with_suffix(".txt")
-        boxes = _read_yolo_labels(label_path, image_w=w, image_h=h)
-
-        selected_tiles: list[tuple[int, int]]
-        if strategy == "centered" and focus_class_id is not None:
-            focus = [b for b in boxes if b.cls_id == int(focus_class_id)]
-            chosen = {_choose_best_tile(px=b.cx, py=b.cy, xs=xs, ys=ys, tile_w=tw, tile_h=th) for b in focus}
-            selected_tiles = sorted(chosen)
-        else:
-            selected_tiles = [(x0, y0) for y0 in ys for x0 in xs]
-
-        for x0, y0 in selected_tiles:
-            tile_boxes = _boxes_in_tile(boxes, x0=x0, y0=y0, tile_w=tw, tile_h=th)
-            if focus_class_id is not None and not any(b.cls_id == int(focus_class_id) for b in tile_boxes):
-                continue
-            if not tile_boxes:
-                continue
-
-            tile_img = img[y0 : y0 + th, x0 : x0 + tw]
-            out_img_path = (split_images_out / rel.parent / f"{rel.stem}_x{x0}_y{y0}{img_path.suffix}").resolve()
-            out_lbl_path = (split_labels_out / rel.parent / f"{rel.stem}_x{x0}_y{y0}.txt").resolve()
-            out_img_path.parent.mkdir(parents=True, exist_ok=True)
-            out_lbl_path.parent.mkdir(parents=True, exist_ok=True)
-            ok = cv2.imwrite(out_img_path.as_posix(), tile_img)
-            if not ok:
-                continue
-            _write_yolo_labels(out_lbl_path, tile_boxes, image_w=tw, image_h=th)
-            train_list.append(out_img_path.as_posix())
-            tiles_written += 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for tile_paths, count in executor.map(run_one, image_paths):
+                train_list.extend(tile_paths)
+                tiles_written += count
 
     return train_list, tiles_written
 
@@ -253,6 +339,7 @@ def build_tiled_dataset(
     include_original: bool,
     splits: list[str],
     limit: Optional[int],
+    workers: Optional[int],
 ) -> Path:
     data = yaml.safe_load(src_data_yaml.read_text()) or {}
     src_base = Path(data.get("path", src_data_yaml.parent)).expanduser().resolve()
@@ -300,6 +387,7 @@ def build_tiled_dataset(
             strategy=strategy,
             include_original=include_original,
             limit=limit,
+            workers=workers,
         )
 
         list_path = out_root / f"{split}.txt"
@@ -367,6 +455,12 @@ def parse_args():
         help="Splits to process (must exist as keys in data.yaml, e.g. train val).",
     )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of images per split (debug).")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Worker threads for tiling (default: auto). Use 1 to disable parallelism.",
+    )
     return parser.parse_args()
 
 
@@ -385,6 +479,7 @@ def main() -> int:
         include_original=bool(args.include_original),
         splits=[str(s) for s in args.splits],
         limit=args.limit,
+        workers=args.workers,
     )
     print(f"Wrote: {out_yaml}")
     return 0

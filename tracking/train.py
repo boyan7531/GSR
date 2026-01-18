@@ -141,6 +141,12 @@ def parse_args():
     )
     parser.add_argument("--tile-rebuild", action="store_true", help="Force rebuilding the tiled dataset cache.")
     parser.add_argument("--tile-limit", type=int, default=None, help="Limit images when building tiles (debug).")
+    parser.add_argument(
+        "--tile-workers",
+        type=int,
+        default=None,
+        help="Worker threads for tiling (default: auto). Use 1 to disable parallelism.",
+    )
 
     parser.set_defaults(per_class_eval=True)
     parser.add_argument(
@@ -212,6 +218,7 @@ def main() -> int:
                 include_original=include_original,
                 splits=[str(s) for s in args.tile_splits],
                 limit=args.tile_limit,
+                workers=args.tile_workers,
             )
         data_yaml = out_yaml
         if run_name == RUN_NAME:
