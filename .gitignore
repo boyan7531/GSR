@@ -5,3 +5,6 @@ SN-GSR-2025/
 __pycache__/
 tracking_dataset
 *.pt
+tracking_dataset_tiled_all_mix_img224_tw224_th168_ov0p2_centered
+tracking_dataset_tiled_ball_mix_img224_tw224_th168_ov0p2_centered
+tracking_dataset_tiled_ball_mix_img416_tw416_th312_ov0p2_centered

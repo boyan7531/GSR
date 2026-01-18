@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_YAML = REPO_ROOT / "tracking_dataset" / "data.yaml"
 
 # Tuned for an L4 GPU: larger model + higher resolution for small objects.
-MODEL_WEIGHTS = "yolo11s.pt"
+MODEL_WEIGHTS = "yolo11n.pt"
 EPOCHS = 150
 IMG_SIZE = 960
 BATCH = 32
@@ -228,7 +228,7 @@ def main() -> int:
         save_period=1,
         name=run_name,
         pretrained=True,
-        val=True,
+        val=False,
         cos_lr=True,
         mixup=0.1,
         copy_paste=0.1,
